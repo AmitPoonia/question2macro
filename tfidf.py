@@ -5,18 +5,20 @@ import re
 import logging
 from time import time
 
+from nltk import SnowballStemmer
 import pandas as pd
-import nltk.data
 import numpy as np  # Make sure that numpy is imported
 import click
-from gensim.models import Word2Vec
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.grid_search import GridSearchCV
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import Pipeline
 from sklearn.cross_validation import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report
 from nltk.corpus import stopwords
 
 
-def wordlist(body, remove_stopwords=False):
+def wordlist(body, remove_stopwords=False, stem=False):
     """ convert a document to a sequence of words, optionally removing stop words.  Returns a list of words."""
 
     # Remove non-letters
@@ -28,6 +30,10 @@ def wordlist(body, remove_stopwords=False):
     if remove_stopwords:
         stops = set(stopwords.words("english"))
         words = [w for w in words if not w in stops]
+
+    if stem:
+        stemmer = SnowballStemmer("english")
+        words = [stemmer.stem(w) for w in words]
 
     return words
 
@@ -112,12 +118,12 @@ def clean_body(questions):
     return l
 
 
-def bench(classifier_kls, params, data):
+def bench_(clf, params, data):
     """ Given a classifier and data benchmark the performance """
 
     t0 = time()
-    clf = classifier_kls(**params)
-    print "Fitting with %r" % classifier_kls
+    clf.set_params(**params)
+    print "Fitting with %r" % clf
     clf = clf.fit(data['X_train'], data['y_train'])
     print "Took: %fs" % (time() - t0)
 
@@ -129,9 +135,9 @@ def bench(classifier_kls, params, data):
     print "Classification report on test set for classifier:"
     print classification_report(data['y_test'], prediction)
 
-    #cm = confusion_matrix(data['y_test'], prediction)
-    #print "Confusion matrix:"
-    #print cm
+    # cm = confusion_matrix(data['y_test'], prediction)
+    # print "Confusion matrix:"
+    # print cm
 
 
 @click.command()
@@ -143,7 +149,7 @@ def main(train_word2vec, verbose):
 
     # Read data from files
     labeled = pd.read_csv(os.path.join(os.path.dirname(__file__), 'conversations_labeled.csv.gz'), header=0,
-                                compression="gzip")
+                          compression="gzip")
 
     # remove the macros that not that popular and insert them into the unlabled training set
     counts = labeled.groupby('macro_id').count()
@@ -154,7 +160,8 @@ def main(train_word2vec, verbose):
 
     unlabeled_train = pd.concat([
         unlabeled_train,
-        pd.read_csv(os.path.join(os.path.dirname(__file__), 'conversations_unlabeled.csv.gz'), header=0, compression="gzip")])
+        pd.read_csv(os.path.join(os.path.dirname(__file__), 'conversations_unlabeled.csv.gz'), header=0,
+                    compression="gzip")])
 
     questions_train, questions_test, macros_train, macros_test = train_test_split(labeled_train['body'],
                                                                                   labeled_train['macro_id'],
@@ -167,62 +174,39 @@ def main(train_word2vec, verbose):
                                           questions_test.size,
                                           unlabeled_train["body"].size)
 
-    model_name = "300features_40minwords_10context"
+    def my_tokenizer(doc):
+        return wordlist(doc, remove_stopwords=True, stem=True)
 
-    # Set params for word2vec
-    num_features = 300  # Word vector dimensionality
-    min_word_count = 40  # Minimum word count
-    num_workers = 8  # Number of threads to run in parallel
-    context = 10  # Context window size
-    downsampling = 1e-3  # Downsample setting for frequent words
+    pipe = Pipeline([
+        ('tfidf', TfidfVectorizer()),
+        ('NB', MultinomialNB()),
+    ])
 
-    if train_word2vec:
-        # Load the punkt tokenizer
-        tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+    param_grid = {
+        'NB__alpha': [0.01, 0.1],
+        'tfidf__max_df': [0.7],
+        'tfidf__tokenizer': [my_tokenizer],
+        'tfidf__ngram_range': [(1, 2), (1, 3)]
+    }
 
-        # Split the labeled and unlabeled training sets into clean sentences
-        sentences = []
-
-        print "Parsing sentences from training set"
-        for body in questions_train:
-            sentences += to_sentences(body, tokenizer)
-
-        print "Parsing sentences from unlabeled set"
-        for body in unlabeled_train["body"]:
-            sentences += to_sentences(body, tokenizer)
-
-        # Initialize and train the model (this will take some time)
-        print "Training Word2Vec model..."
-        model = Word2Vec(sentences, workers=num_workers, size=num_features,
-                         min_count=min_word_count, window=context, sample=downsampling, seed=1)
-        # compact the model memory footprint
-        model.init_sims(replace=True)
-        model.save(model_name)
-    else:
-        model = Word2Vec.load(model_name)
-        model.init_sims(replace=True)
-
-    print "Creating average feature vecs for training reviews"
-    trainDataVecs = average_vec(clean_body(questions_train), model, num_features)
-
-    print "Creating average feature vecs for test reviews"
-    testDataVecs = average_vec(clean_body(questions_test), model, num_features)
+    #gs_pipe = GridSearchCV(pipe, param_grid)
+    #gs_pipe.fit(questions_train, macros_train)
 
     params = {
-        'n_estimators': 400,
-        'max_depth': 10,
-        'random_state': 42,
-        'n_jobs': -1
+        'NB__alpha': 0.01,
+        'tfidf__ngram_range': (1, 2),
+        'tfidf__max_df': 0.7,
+        'tfidf__tokenizer': my_tokenizer
     }
 
     data = {
-        'X_train': trainDataVecs,
-        'X_test': testDataVecs,
+        'X_train': questions_train,
+        'X_test': questions_test,
         'y_train': macros_train,
         'y_test': macros_test
     }
 
-    bench(RandomForestClassifier, params, data)
+    bench_(pipe, params, data)
 
 
 if __name__ == '__main__':
